@@ -1,0 +1,16 @@
+.venv/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local runtime/cache data
+fuel_api_cache.json
+
+# Local secrets
+oauth.yml
+
+# OS/editor noise
+.DS_Store
+.vscode/
