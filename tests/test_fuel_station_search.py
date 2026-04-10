@@ -292,7 +292,7 @@ def test_load_or_fetch_rows_cache_hit_and_miss(
     monkeypatch.setattr(
         fss,
         "fetch_batches",
-        lambda tmpl, token: (
+        lambda tmpl, token, dataset_name="data": (
             [{"kind": "pfs"}] if "fuel-prices" not in tmpl else [{"kind": "prices"}]
         ),
     )

@@ -17,6 +17,8 @@
 import argparse
 import json
 import math
+import os
+import sys
 import time
 from pathlib import Path
 from urllib import error, parse, request
@@ -28,6 +30,19 @@ PRICES_URL = "https://www.fuel-finder.service.gov.uk/api/v1/pfs/fuel-prices?batc
 CACHE_FILE = Path("fuel_api_cache.json")
 DEFAULT_OAUTH_FILE = Path.home() / ".fuel_station_oath.yml"
 CACHE_TTL_SECONDS = 2 * 60 * 60  # 2 hours
+
+
+def supports_fancy_progress() -> bool:
+    return sys.stderr.isatty() and os.environ.get("TERM", "") not in {"", "dumb"}
+
+
+def render_progress_bar(current: int, width: int = 30) -> str:
+    if current <= 0:
+        return "[" + (" " * width) + "]"
+    position = (current - 1) % width
+    bar = ["-"] * width
+    bar[position] = "#"
+    return "[" + "".join(bar) + "]"
 
 
 def parse_coordinate(value: str) -> float:
@@ -132,10 +147,11 @@ def get_access_token(client_id: str, client_secret: str) -> str:
     raise RuntimeError("Could not retrieve OAuth access token from token endpoint response")
 
 
-def fetch_batches(url_template: str, token: str) -> list[dict]:
+def fetch_batches(url_template: str, token: str, dataset_name: str = "data") -> list[dict]:
     results: list[dict] = []
     batch = 1
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    fancy = supports_fancy_progress()
 
     while True:
         url = url_template.format(batch)
@@ -152,8 +168,38 @@ def fetch_batches(url_template: str, token: str) -> list[dict]:
             raise RuntimeError(f"Unexpected API response for batch {batch}: expected list")
 
         results.extend(data)
+        if fancy:
+            bar = render_progress_bar(batch)
+            print(
+                f"\rDownloading {dataset_name}: {bar} batches={batch} records={len(results)}",
+                file=sys.stderr,
+                end="",
+                flush=True,
+            )
+        else:
+            print(
+                f"Downloaded {dataset_name} batch {batch} ({len(data)} records)",
+                file=sys.stderr,
+                flush=True,
+            )
         batch += 1
 
+    if fancy:
+        final_message = (
+            f"\rFinished downloading {dataset_name}: "
+            f"{batch - 1} batches, {len(results)} total records"
+        )
+        print(
+            final_message,
+            file=sys.stderr,
+            flush=True,
+        )
+    else:
+        print(
+            f"Finished downloading {dataset_name}: {len(results)} total records",
+            file=sys.stderr,
+            flush=True,
+        )
     return results
 
 
@@ -351,8 +397,13 @@ def load_or_fetch_rows(args: argparse.Namespace) -> tuple[list[dict], list[dict]
         raise RuntimeError("OAuth credentials file must contain client_id and client_secret")
 
     token = get_access_token(client_id, client_secret)
-    pfs_rows = fetch_batches(PFS_URL, token)
-    price_rows = fetch_batches(PRICES_URL, token)
+    print(
+        "Fetching latest data from the Fuel Finder API. This may take a few minutes...",
+        file=sys.stderr,
+        flush=True,
+    )
+    pfs_rows = fetch_batches(PFS_URL, token, dataset_name="stations")
+    price_rows = fetch_batches(PRICES_URL, token, dataset_name="prices")
     save_cache(cache_path, pfs_rows, price_rows)
     return pfs_rows, price_rows
 
