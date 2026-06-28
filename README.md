@@ -1,6 +1,6 @@
 # Fuel Station Search (UK Gov Fuel Finder API)
 
-This is a small command-line Python tool that finds UK petrol stations within a radius of a given latitude/longitude using the UK Government Fuel Finder API.
+This is a small command-line Python tool that finds UK petrol stations within a radius of a given UK postcode or latitude/longitude using the UK Government Fuel Finder API.
 
 It can:
 - fetch station and fuel price data from the API,
@@ -12,15 +12,16 @@ It can:
 
 ## What this tool does
 
-Given a coordinate pair (`latitude` and `longitude`), the tool:
+Given a postcode or coordinate pair (`latitude` and `longitude`), the tool:
 
-1. Reads your API client credentials from a local credentials file.
-2. Requests an OAuth access token from the UK Gov endpoint.
-3. Downloads station + fuel price batch data.
-4. Joins station and price records.
-5. Computes distance from your input location.
-6. Filters stations within the selected mile radius.
-7. Sorts and prints results in your chosen output format.
+1. Resolves a postcode to coordinates with Postcodes.io, if a postcode was provided.
+2. Reads your API client credentials from a local credentials file.
+3. Requests an OAuth access token from the UK Gov endpoint.
+4. Downloads station + fuel price batch data.
+5. Joins station and price records.
+6. Computes distance from your input location.
+7. Filters stations within the selected mile radius.
+8. Sorts and prints results in your chosen output format.
 
 ---
 
@@ -72,6 +73,13 @@ You can override this path with `--oauth-file`.
 uv run fuel_station_search.py 51.5074 -0.1278
 ```
 
+You can also provide a UK postcode instead of coordinates:
+
+```bash
+uv run fuel_station_search.py SW1A 1AA
+uv run fuel_station_search.py "SW1A 1AA"
+```
+
 ### Getting latitude/longitude from Google Maps
 
 1. Open Google Maps and find your location.
@@ -102,6 +110,9 @@ uv run fuel_station_search.py 51.5074, -0.1278,
 # Default table output
 uv run fuel_station_search.py 51.5074 -0.1278
 
+# Postcode input
+uv run fuel_station_search.py SW1A 1AA
+
 # CSV output
 uv run fuel_station_search.py 51.5074 -0.1278 --output csv
 
@@ -111,6 +122,10 @@ uv run fuel_station_search.py 51.5074 -0.1278 --output json
 # YAML output
 uv run fuel_station_search.py 51.5074 -0.1278 --output yaml
 ```
+
+### Troubleshooting
+
+If you see `Fuel Finder OAuth token request was denied (HTTP 401/403)`, the postcode lookup has already succeeded and the failure is from the UK Gov Fuel Finder OAuth endpoint. Check the `client_id` and `client_secret` in your OAuth file, or regenerate the credentials from the Fuel Finder developer portal.
 
 ---
 

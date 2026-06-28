@@ -53,6 +53,33 @@ def test_parse_coordinate_rejects_invalid() -> None:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
+        ("sw1a1aa", "SW1A 1AA"),
+        ("SW1A 1AA", "SW1A 1AA"),
+        (" ec1a 1bb ", "EC1A 1BB"),
+        ("GIR0AA", "GIR 0AA"),
+        ("not a postcode", None),
+        ("", None),
+    ],
+)
+def test_normalize_postcode(value: str, expected: str | None) -> None:
+    assert fss.normalize_postcode(value) == expected
+
+
+def test_parse_reference_location_detects_coordinates_and_postcode() -> None:
+    latitude, longitude, postcode = fss.parse_reference_location(["51.5074,", "-0.1278,"])
+    assert latitude == pytest.approx(51.5074)
+    assert longitude == pytest.approx(-0.1278)
+    assert postcode is None
+
+    assert fss.parse_reference_location(["sw1a", "1aa"]) == (None, None, "SW1A 1AA")
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        fss.parse_reference_location(["north"])
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
         (None, None),
         ("", None),
         ("  ", None),
@@ -122,12 +149,104 @@ def test_http_json_raises_last_error(monkeypatch: pytest.MonkeyPatch) -> None:
         fss.http_json("https://example.test", retries=1)
 
 
+def test_http_json_does_not_retry_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout):
+        calls["n"] += 1
+        raise error.HTTPError(req.full_url, 403, "forbidden", hdrs=Message(), fp=None)
+
+    monkeypatch.setattr(fss.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(fss.time, "sleep", lambda s: pytest.fail("HTTP errors are not retried"))
+
+    with pytest.raises(error.HTTPError):
+        fss.http_json("https://example.test", retries=3)
+
+    assert calls["n"] == 1
+
+
+def test_lookup_postcode_coordinates_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_http_json(url: str, timeout: int, retries: int):
+        seen["url"] = url
+        seen["timeout"] = timeout
+        seen["retries"] = retries
+        return {"status": 200, "result": {"latitude": "51.501009", "longitude": -0.141588}}
+
+    monkeypatch.setattr(fss, "http_json", fake_http_json)
+
+    latitude, longitude = fss.lookup_postcode_coordinates("sw1a 1aa")
+
+    assert latitude == pytest.approx(51.501009)
+    assert longitude == pytest.approx(-0.141588)
+    assert seen == {
+        "url": "https://api.postcodes.io/postcodes/SW1A%201AA",
+        "timeout": 30,
+        "retries": 1,
+    }
+
+
+def test_lookup_postcode_coordinates_rejects_invalid_before_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        fss,
+        "http_json",
+        lambda *a, **k: pytest.fail("invalid postcode should not call API"),
+    )
+
+    with pytest.raises(RuntimeError, match="Invalid UK postcode"):
+        fss.lookup_postcode_coordinates("north")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        {"status": 404, "result": None},
+        {"status": 200, "result": []},
+        {"status": 200, "result": {"latitude": None, "longitude": -0.141588}},
+    ],
+)
+def test_lookup_postcode_coordinates_validates_response(
+    payload: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fss, "http_json", lambda *a, **k: payload)
+
+    with pytest.raises(RuntimeError):
+        fss.lookup_postcode_coordinates("SW1A 1AA")
+
+
+def test_lookup_postcode_coordinates_converts_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_http_json(*a, **k):
+        raise error.HTTPError("https://example.test", 404, "not found", hdrs=Message(), fp=None)
+
+    monkeypatch.setattr(fss, "http_json", fake_http_json)
+
+    with pytest.raises(RuntimeError, match="was not found"):
+        fss.lookup_postcode_coordinates("SW1A 1AA")
+
+
 def test_get_access_token_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(fss, "http_json", lambda *a, **k: {"access_token": "t1"})
     assert fss.get_access_token("id", "secret") == "t1"
 
     monkeypatch.setattr(fss, "http_json", lambda *a, **k: {"data": {"token": "t2"}})
     assert fss.get_access_token("id", "secret") == "t2"
+
+
+def test_get_access_token_forbidden_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_http_json(*a, **k):
+        raise error.HTTPError("https://example.test", 403, "forbidden", hdrs=Message(), fp=None)
+
+    monkeypatch.setattr(fss, "http_json", fake_http_json)
+
+    with pytest.raises(RuntimeError, match="OAuth token request was denied"):
+        fss.get_access_token("id", "secret")
 
 
 def test_get_access_token_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -246,6 +365,7 @@ def test_parse_args_and_build_matches(monkeypatch: pytest.MonkeyPatch) -> None:
     args = fss.parse_args()
     assert args.latitude == pytest.approx(51.5)
     assert args.longitude == pytest.approx(-0.12)
+    assert args.postcode is None
     assert args.output == "json"
 
     stations = [
@@ -262,6 +382,79 @@ def test_parse_args_and_build_matches(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     assert len(fss.build_matches(stations, 51.5, -0.12, 0.001)) == 1
     assert fss.build_matches(stations, 0.0, 0.0, 0.001) == []
+
+
+def test_parse_args_accepts_unquoted_postcode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "fuel_station_search.py",
+            "sw1a",
+            "1aa",
+            "--output",
+            "json",
+        ],
+    )
+
+    args = fss.parse_args()
+
+    assert args.latitude is None
+    assert args.longitude is None
+    assert args.postcode == "SW1A 1AA"
+    assert args.output == "json"
+
+
+def test_resolve_reference_location_uses_postcode_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fss, "lookup_postcode_coordinates", lambda postcode: (51.5, -0.12))
+    args = argparse.Namespace(latitude=None, longitude=None, postcode="SW1A 1AA")
+
+    assert fss.resolve_reference_location(args) == (51.5, -0.12)
+
+
+def test_main_accepts_postcode_without_live_api(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "fuel_station_search.py",
+            "SW1A",
+            "1AA",
+            "--output",
+            "json",
+        ],
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_lookup(postcode: str) -> tuple[float, float]:
+        calls.append(("lookup", postcode))
+        return 51.5, -0.12
+
+    def fake_load(args: argparse.Namespace) -> tuple[list[dict], list[dict]]:
+        calls.append(("load", args.postcode))
+        return (
+            [
+                {
+                    "node_id": "1",
+                    "trading_name": "T",
+                    "brand_name": "B",
+                    "location": {"latitude": "51.5", "longitude": "-0.12", "postcode": "P"},
+                }
+            ],
+            [{"node_id": "1", "fuel_prices": [{"fuel_type": "E10", "price": 140.0}]}],
+        )
+
+    monkeypatch.setattr(fss, "lookup_postcode_coordinates", fake_lookup)
+    monkeypatch.setattr(fss, "load_or_fetch_rows", fake_load)
+
+    assert fss.main() == 0
+
+    assert calls == [("lookup", "SW1A 1AA"), ("load", "SW1A 1AA")]
+    output = json.loads(capsys.readouterr().out)
+    assert output[0]["postcode"] == "P"
+    assert output[0]["e10"] == 140.0
 
 
 def test_load_or_fetch_rows_cache_hit_and_miss(

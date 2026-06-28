@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -27,9 +28,11 @@ EARTH_RADIUS_MILES = 3958.8
 TOKEN_URL = "https://www.fuel-finder.service.gov.uk/api/v1/oauth/generate_access_token"
 PFS_URL = "https://www.fuel-finder.service.gov.uk/api/v1/pfs?batch-number={}"
 PRICES_URL = "https://www.fuel-finder.service.gov.uk/api/v1/pfs/fuel-prices?batch-number={}"
+POSTCODE_URL = "https://api.postcodes.io/postcodes/{}"
 CACHE_FILE = Path("fuel_api_cache.json")
 DEFAULT_OAUTH_FILE = Path.home() / ".fuel_station_oath.yml"
 CACHE_TTL_SECONDS = 2 * 60 * 60  # 2 hours
+UK_POSTCODE_RE = re.compile(r"^(?:GIR0AA|[A-Z]{1,2}\d[A-Z\d]?\d[A-Z]{2})$")
 
 
 def supports_fancy_progress() -> bool:
@@ -53,6 +56,77 @@ def parse_coordinate(value: str) -> float:
         raise argparse.ArgumentTypeError(
             f"Invalid coordinate '{value}'. Expected a decimal number."
         ) from exc
+
+
+def normalize_postcode(value: str) -> str | None:
+    compact = re.sub(r"\s+", "", value.strip().upper())
+    if not UK_POSTCODE_RE.fullmatch(compact):
+        return None
+    if compact == "GIR0AA":
+        return "GIR 0AA"
+    return f"{compact[:-3]} {compact[-3:]}"
+
+
+def parse_reference_location(
+    location_parts: list[str],
+) -> tuple[float | None, float | None, str | None]:
+    if len(location_parts) == 2:
+        try:
+            return parse_coordinate(location_parts[0]), parse_coordinate(location_parts[1]), None
+        except argparse.ArgumentTypeError:
+            pass
+
+    postcode = normalize_postcode(" ".join(location_parts))
+    if postcode:
+        return None, None, postcode
+
+    raise argparse.ArgumentTypeError(
+        "Expected either latitude longitude coordinates or a UK postcode."
+    )
+
+
+def lookup_postcode_coordinates(postcode: str) -> tuple[float, float]:
+    normalized = normalize_postcode(postcode)
+    if normalized is None:
+        raise RuntimeError(f"Invalid UK postcode '{postcode}'")
+
+    try:
+        data = http_json(
+            POSTCODE_URL.format(parse.quote(normalized, safe="")),
+            timeout=30,
+            retries=1,
+        )
+    except error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError(f"Postcode '{normalized}' was not found") from exc
+        raise RuntimeError(f"Could not look up postcode '{normalized}' (HTTP {exc.code})") from exc
+    except (error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not look up postcode '{normalized}': {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected postcode lookup response for '{normalized}'")
+
+    result = data.get("result")
+    if data.get("status") == 404 or result is None:
+        raise RuntimeError(f"Postcode '{normalized}' was not found")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Unexpected postcode lookup response for '{normalized}'")
+
+    latitude = parse_float(result.get("latitude"))
+    longitude = parse_float(result.get("longitude"))
+    if latitude is None or longitude is None:
+        raise RuntimeError(
+            f"Postcode lookup response for '{normalized}' did not include coordinates"
+        )
+    return latitude, longitude
+
+
+def resolve_reference_location(args: argparse.Namespace) -> tuple[float, float]:
+    if args.postcode:
+        return lookup_postcode_coordinates(args.postcode)
+    if args.latitude is None or args.longitude is None:
+        raise RuntimeError("Missing reference location")
+    return args.latitude, args.longitude
 
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -117,6 +191,8 @@ def http_json(
                 if not payload:
                     return None
                 return json.loads(payload)
+        except error.HTTPError:
+            raise
         except (error.URLError, TimeoutError) as e:
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
@@ -132,12 +208,29 @@ def get_access_token(client_id: str, client_secret: str) -> str:
             "client_secret": client_secret,
         }
     ).encode("utf-8")
-    data = http_json(
-        TOKEN_URL,
-        method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-        body=payload,
-    )
+    try:
+        data = http_json(
+            TOKEN_URL,
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            body=payload,
+        )
+    except error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise RuntimeError(
+                "Fuel Finder OAuth token request was denied "
+                f"(HTTP {exc.code}). Check client_id/client_secret in your OAuth file "
+                "and confirm the API account still has access."
+            ) from exc
+        raise RuntimeError(
+            f"Fuel Finder OAuth token request failed with HTTP {exc.code}"
+        ) from exc
+    except (error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not reach Fuel Finder OAuth token endpoint: {exc}") from exc
+
     if isinstance(data, dict):
         token = data.get("access_token") or data.get("token")
         if not token and isinstance(data.get("data"), dict):
@@ -359,8 +452,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Find petrol stations within radius using UK Gov Fuel Finder API (OAuth)."
     )
-    parser.add_argument("latitude", type=parse_coordinate, help="Reference latitude")
-    parser.add_argument("longitude", type=parse_coordinate, help="Reference longitude")
+    parser.add_argument(
+        "location",
+        nargs="+",
+        help="Reference latitude longitude coordinates or UK postcode",
+    )
     parser.add_argument(
         "--miles", type=float, default=10.0, help="Search radius in miles (default: 10)"
     )
@@ -380,7 +476,12 @@ def parse_args() -> argparse.Namespace:
         default="text",
         help="Output format (default: text)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.latitude, args.longitude, args.postcode = parse_reference_location(args.location)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def load_or_fetch_rows(args: argparse.Namespace) -> tuple[list[dict], list[dict]]:
@@ -446,12 +547,13 @@ def main() -> int:
     args = parse_args()
 
     try:
+        latitude, longitude = resolve_reference_location(args)
         pfs_rows, price_rows = load_or_fetch_rows(args)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from exc
 
     stations = build_joined_data(pfs_rows, price_rows)
-    matches = build_matches(stations, args.latitude, args.longitude, args.miles)
+    matches = build_matches(stations, latitude, longitude, args.miles)
 
     matches.sort(key=lambda x: sort_value(x, args.sort_by))
 
